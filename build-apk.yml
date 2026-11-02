@@ -1,0 +1,177 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create project config
+        run: |
+          cat > package.json <<'PKG'
+          {
+            "name": "sm40-duty-log",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/cli": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor/filesystem": "^7.0.0",
+              "@capacitor/share": "^7.0.0",
+              "@fontsource/hind-siliguri": "^5.0.0",
+              "@fortawesome/fontawesome-free": "^6.4.0",
+              "html2canvas": "^1.4.1",
+              "jspdf": "^2.5.2",
+              "xlsx": "^0.18.5"
+            },
+            "devDependencies": {
+              "@capacitor/assets": "^3.0.5",
+              "tailwindcss": "^3.4.17"
+            }
+          }
+          PKG
+          cat > capacitor.config.json <<'CFG'
+          {
+            "appId": "com.sm40.dutylog",
+            "appName": "SM40 ডিউটি",
+            "webDir": "www",
+            "android": {
+              "allowMixedContent": false,
+              "adjustMarginsForEdgeToEdge": "auto"
+            }
+          }
+          CFG
+          npm install --no-audit --no-fund
+
+      - name: Build offline web files
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, shutil, glob
+
+          os.makedirs('www/vendor/fa', exist_ok=True)
+          os.makedirs('www/vendor/fonts/files', exist_ok=True)
+
+          # --- লাইব্রেরি লোকাল কপি ---
+          nm = 'node_modules'
+          shutil.copy(f'{nm}/html2canvas/dist/html2canvas.min.js', 'www/vendor/html2canvas.min.js')
+          shutil.copy(f'{nm}/xlsx/dist/xlsx.full.min.js', 'www/vendor/xlsx.full.min.js')
+          shutil.copy(f'{nm}/jspdf/dist/jspdf.umd.min.js', 'www/vendor/jspdf.umd.min.js')
+          fa = f'{nm}/@fortawesome/fontawesome-free'
+          shutil.copytree(f'{fa}/css', 'www/vendor/fa/css', dirs_exist_ok=True)
+          shutil.copytree(f'{fa}/webfonts', 'www/vendor/fa/webfonts', dirs_exist_ok=True)
+
+          # --- বাংলা ফন্ট (Hind Siliguri) ---
+          fs = f'{nm}/@fontsource/hind-siliguri'
+          css = ''
+          for sub in ('bengali', 'latin'):
+              for w in (300, 400, 500, 600, 700):
+                  p = f'{fs}/{sub}-{w}.css'
+                  if os.path.exists(p):
+                      css += open(p, encoding='utf-8').read() + '\n'
+          assert css, 'ফন্ট CSS পাওয়া যায়নি'
+          open('www/vendor/fonts/fonts.css', 'w', encoding='utf-8').write(css)
+          for f in glob.glob(f'{fs}/files/hind-siliguri-*-normal.woff2'):
+              if re.search(r'-(bengali|latin)-(300|400|500|600|700)-normal', f):
+                  shutil.copy(f, 'www/vendor/fonts/files/')
+
+          # --- index.html: CDN লিঙ্ক বদলে লোকাল ফাইল ---
+          h = open('index.html', encoding='utf-8').read()
+          h = re.sub(r'\s*<script src="https://cdn\.tailwindcss\.com"></script>', '', h)
+          h = re.sub(r'\s*<script>\s*tailwind\.config = .*?</script>', '', h, flags=re.S)
+          h = re.sub(r'\s*<link rel="preconnect"[^>]*>', '', h)
+          h = re.sub(r'\s*<link href="https://fonts\.googleapis\.com[^>]*>', '', h)
+          h = re.sub(r'\s*<link rel="stylesheet" href="https://cdnjs\.cloudflare\.com/ajax/libs/font-awesome[^>]*>', '', h)
+          h = re.sub(r'\s*<script src="https://cdnjs\.cloudflare\.com/[^"]*"></script>', '', h)
+          local = '''
+              <link rel="stylesheet" href="vendor/tailwind.css">
+              <link rel="stylesheet" href="vendor/fa/css/all.min.css">
+              <link rel="stylesheet" href="vendor/fonts/fonts.css">
+              <script src="vendor/html2canvas.min.js"></script>
+              <script src="vendor/xlsx.full.min.js"></script>
+              <script src="vendor/jspdf.umd.min.js"></script>'''
+          assert '</title>' in h
+          h = h.replace('</title>', '</title>' + local, 1)
+          assert 'https://cdn' not in h and 'googleapis' not in h, 'CDN লিঙ্ক রয়ে গেছে'
+          open('www/index.html', 'w', encoding='utf-8').write(h)
+          PYEOF
+          printf '@tailwind base;\n@tailwind components;\n@tailwind utilities;\n' > tw-input.css
+          npx tailwindcss -i tw-input.css -o www/vendor/tailwind.css --content ./www/index.html --minify
+
+      - name: Create app icons
+        run: |
+          pip install pillow
+          python3 - <<'PYEOF'
+          import math, os
+          from PIL import Image, ImageDraw
+          os.makedirs('assets', exist_ok=True)
+          S = 1024
+
+          def clock(d, cx, cy, r, ring, hand):
+              d.ellipse([cx-r, cy-r, cx+r, cy+r], fill='#ffffff')
+              rr = int(r*0.86)
+              d.ellipse([cx-rr, cy-rr, cx+rr, cy+rr], outline=ring, width=10)
+              for i in range(12):
+                  a = math.radians(i*30)
+                  l = 0.14 if i % 3 == 0 else 0.07
+                  d.line([(cx+math.sin(a)*rr*0.90, cy-math.cos(a)*rr*0.90),
+                          (cx+math.sin(a)*rr*(0.90-l), cy-math.cos(a)*rr*(0.90-l))], fill=ring, width=8)
+              w = 22
+              d.line([(cx, cy), (cx, cy-rr*0.62)], fill=hand, width=w)
+              a = math.radians(120)
+              d.line([(cx, cy), (cx+math.sin(a)*rr*0.45, cy-math.cos(a)*rr*0.45)], fill=hand, width=w)
+              d.ellipse([cx-w, cy-w, cx+w, cy+w], fill=hand)
+
+          img = Image.new('RGB', (S, S), '#047857')
+          clock(ImageDraw.Draw(img), S//2, S//2, int(S*0.30), '#047857', '#065f46')
+          img.save('assets/icon-only.png')
+
+          Image.new('RGB', (S, S), '#047857').save('assets/icon-background.png')
+
+          fg = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+          clock(ImageDraw.Draw(fg), S//2, S//2, int(S*0.22), '#047857', '#065f46')
+          fg.save('assets/icon-foreground.png')
+          PYEOF
+
+      - name: Add Android platform
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android
+          npx cap sync android
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk SM40-DutyLog.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SM40-DutyLog-apk
+          path: SM40-DutyLog.apk
+
+      - name: Publish release (direct download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" SM40-DutyLog.apk \
+            --title "SM40 ডিউটি লগ - build ${{ github.run_number }}" \
+            --notes "ফোনে এই APK ফাইলটি ডাউনলোড করে ইনস্টল করুন।"
